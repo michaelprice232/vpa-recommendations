@@ -1,3 +1,7 @@
+/*
+Script which deploys a K8s VPA for deployment/statefulset/daemonset resources across all namespaces.
+If a VPA already exists which targets the resource then it is skipped.
+*/
 package main
 
 import (
@@ -48,10 +52,6 @@ func main() {
 	for _, n := range namespaces.Items {
 		namespace := n.Name
 
-		// TODO: remove
-		if namespace != "tracing" {
-			continue
-		}
 		l.Debug("Processing namespace", "namespace", namespace)
 
 		vpas, err := vpaClient.AutoscalingV1().VerticalPodAutoscalers(namespace).List(context.TODO(), metav1.ListOptions{})
