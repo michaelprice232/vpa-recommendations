@@ -10,6 +10,22 @@ Scripts:
 - `/manage-vpas`: deploys a VPA for every deployment/statefulset/daemonset resource. Skips if a VPA already exists for that resource
 - `/get-recommendations`: queries every VPA in the cluster and outputs the uncapped CPU/memory recommendations as a CSV file
 
-Example CSV output:
+### How to run 
+
+```shell
+# Create VPAs
+kubectx <k8s-context>
+cd ./manage-vpas
+go run ./manage-vpas.go [--namespaces=<comma-separated-list>]
+```
+
+```shell
+# Get recommendations from existing VPAs and output a CSV (results.csv)
+kubectx <k8s-context>
+cd ./get-recommendations
+go run ./get-recommendations.go [--namespaces=<comma-separated-list>]
+```
+
+### Example CSV output:
 
 ![Example CSV Output](./assets/example-output.png)

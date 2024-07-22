@@ -6,11 +6,13 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	autoscaling "k8s.io/api/autoscaling/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -30,6 +32,14 @@ func main() {
 		panic(err)
 	}
 
+	var namespaces []string
+	n := flag.String("namespaces", "", "comma separated list of namespaces")
+	flag.Parse()
+	if *n != "" {
+		namespaces = strings.Split(*n, ",")
+		l.Info("Targeting specific namespaces", "namespaces", *n)
+	}
+
 	config, err := clientcmd.BuildConfigFromFlags("", filepath.Join(homedir.HomeDir(), ".kube", "config"))
 	if err != nil {
 		panic(err.Error())
@@ -45,12 +55,14 @@ func main() {
 		panic(err.Error())
 	}
 
-	namespaces, err := clientset.CoreV1().Namespaces().List(context.TODO(), metav1.ListOptions{})
-	if err != nil {
-		panic(err.Error())
+	if len(namespaces) == 0 {
+		namespaces, err = getNamespaces(clientset)
+		if err != nil {
+			panic(err.Error())
+		}
 	}
-	for _, n := range namespaces.Items {
-		namespace := n.Name
+
+	for _, namespace := range namespaces {
 
 		l.Debug("Processing namespace", "namespace", namespace)
 
@@ -174,6 +186,22 @@ func containsVPATarget(spec *autoscaling.CrossVersionObjectReference, vpas []ver
 	}
 
 	return found, existingVPAName
+}
+
+// getNamespaces returns all the namespaces in the cluster
+func getNamespaces(client *kubernetes.Clientset) ([]string, error) {
+	result := make([]string, 0)
+
+	namespaces, err := client.CoreV1().Namespaces().List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return result, err
+	}
+
+	for _, ns := range namespaces.Items {
+		result = append(result, ns.Name)
+	}
+
+	return result, nil
 }
 
 // getLogger creates structured logger and default to error level (https://pkg.go.dev/log/slog#Level).
