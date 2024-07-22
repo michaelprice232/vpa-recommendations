@@ -24,12 +24,13 @@ import (
 const resultsFile = "results.csv"
 
 type containerConfig struct {
-	namespace      string
-	deploymentName string
-	containerName  string
-	vpaName        string
-	targetCPU      string
-	targetMemory   string
+	namespace     string
+	resourceType  string
+	resourceName  string
+	containerName string
+	vpaName       string
+	targetCPU     string
+	targetMemory  string
 }
 
 func main() {
@@ -85,12 +86,13 @@ func main() {
 				cpuTarget := t2.String()
 
 				r := containerConfig{
-					namespace:      namespace,
-					deploymentName: vpa.Spec.TargetRef.Name,
-					containerName:  containerRecommendation.ContainerName,
-					vpaName:        vpa.Name,
-					targetCPU:      cpuTarget,
-					targetMemory:   memoryTarget,
+					namespace:     namespace,
+					resourceType:  vpa.Spec.TargetRef.Kind,
+					resourceName:  vpa.Spec.TargetRef.Name,
+					containerName: containerRecommendation.ContainerName,
+					vpaName:       vpa.Name,
+					targetCPU:     cpuTarget,
+					targetMemory:  memoryTarget,
 				}
 				results = append(results, r)
 			}
@@ -99,11 +101,11 @@ func main() {
 
 	l.Info("Results", "count", len(results))
 
-	// csv package expects slices of strings
+	// csv package expects a slice of string slices. Each slice is a CSV row
 	csvSource := make([][]string, 0)
-	csvSource = append(csvSource, []string{"namespace", "deploymentName", "containerName", "targetCPU", "targetMemory"})
+	csvSource = append(csvSource, []string{"namespace", "resourceType", "resourceName", "containerName", "targetCPU", "targetMemory"})
 	for _, r := range results {
-		csvSource = append(csvSource, []string{r.namespace, r.deploymentName, r.containerName, r.targetCPU, r.targetMemory})
+		csvSource = append(csvSource, []string{r.namespace, r.resourceType, r.resourceName, r.containerName, r.targetCPU, r.targetMemory})
 	}
 
 	_ = os.Remove(resultsFile)
@@ -118,10 +120,7 @@ func main() {
 			panic(err)
 		}
 	}
-
-	// Write any buffered data to the underlying writer (standard output).
 	w.Flush()
-
 	if err := w.Error(); err != nil {
 		panic(err)
 	}
