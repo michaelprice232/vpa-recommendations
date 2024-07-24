@@ -1,6 +1,6 @@
 /*
-Script which queries the K8s VPA in every namespace and outputs the uncapped CPU and memory recommendations in CSV format.
-The units are in K8s resource format to make it easier to copy into source control.
+Script which queries the K8s VPA in every namespace (or scoped to a subset) and outputs the uncapped CPU and memory recommendations in CSV format.
+The units are in K8s resource format to make it easier to copy into source control when updating services based on the recommendations.
 */
 
 package main
@@ -42,7 +42,7 @@ func main() {
 	}
 
 	var namespaces []string
-	n := flag.String("namespaces", "", "comma separated list of namespaces")
+	n := flag.String("namespaces", "", "comma separated list of namespaces to query")
 	flag.Parse()
 	if *n != "" {
 		namespaces = strings.Split(*n, ",")
@@ -110,10 +110,17 @@ func main() {
 		}
 	}
 
-	l.Info("Results", "count", len(results))
+	l.Info("Container recommendation results", "count", len(results))
 
+	err = writeResults(results)
+	if err != nil {
+		panic(err.Error())
+	}
+}
+
+func writeResults(results []containerConfig) error {
 	// csv package expects a slice of string slices. Each slice is a CSV row
-	csvSource := make([][]string, 0)
+	csvSource := make([][]string, 0, len(results))
 	csvSource = append(csvSource, []string{"namespace", "resourceType", "resourceName", "containerName", "targetCPU", "targetMemory"})
 	for _, r := range results {
 		csvSource = append(csvSource, []string{r.namespace, r.resourceType, r.resourceName, r.containerName, r.targetCPU, r.targetMemory})
@@ -122,19 +129,21 @@ func main() {
 	_ = os.Remove(resultsFile)
 	f, err := os.Create(resultsFile)
 	if err != nil {
-		panic(err.Error())
+		return fmt.Errorf("creating results file: %w", err)
 	}
 
 	w := csv.NewWriter(f)
 	for _, record := range csvSource {
 		if err := w.Write(record); err != nil {
-			panic(err)
+			return fmt.Errorf("writing results to csv: %w", err)
 		}
 	}
 	w.Flush()
 	if err := w.Error(); err != nil {
-		panic(err)
+		return fmt.Errorf("flushing csv writer: %w", err)
 	}
+
+	return nil
 }
 
 // getNamespaces returns all the namespaces in the cluster
@@ -143,7 +152,7 @@ func getNamespaces(client *kubernetes.Clientset) ([]string, error) {
 
 	namespaces, err := client.CoreV1().Namespaces().List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
-		return result, err
+		return result, fmt.Errorf("error listing namespaces: %v", err)
 	}
 
 	for _, ns := range namespaces.Items {
@@ -153,7 +162,7 @@ func getNamespaces(client *kubernetes.Clientset) ([]string, error) {
 	return result, nil
 }
 
-// getLogger creates structured logger and default to error level (https://pkg.go.dev/log/slog#Level).
+// getLogger creates a structured logger and defaults to error level (https://pkg.go.dev/log/slog#Level).
 func getLogger() (*slog.Logger, error) {
 	var logger *slog.Logger
 
