@@ -35,8 +35,6 @@ type containerConfig struct {
 	vpaName         string
 	targetCPUStr    string
 	targetMemoryStr string
-	targetCPU       int64
-	targetMem       int64
 	currentConfig   resourceDrift
 }
 
@@ -120,10 +118,10 @@ func main() {
 				// Get uncapped CPU recommendation. It's already in the correct K8s format
 				t2 := containerRecommendation.UncappedTarget["cpu"]
 				cpuTargetStr := t2.String()
-				cpuTargetRaw := t2.Value()
+				cpuTargetRaw := t2.MilliValue()
 
 				// Get the current container resource config and calculate the diff from the recommendation
-				drift, err := calculateCurrentConfigDiff(vpa.Spec.TargetRef.Name, vpa.Spec.TargetRef.Kind, containerRecommendation.ContainerName, namespace, clientset)
+				resourceConfig, err := currentResourceConfig(vpa.Spec.TargetRef.Name, vpa.Spec.TargetRef.Kind, containerRecommendation.ContainerName, namespace, clientset, l)
 				if err != nil {
 					panic(err.Error())
 				}
@@ -136,19 +134,18 @@ func main() {
 					vpaName:         vpa.Name,
 					targetCPUStr:    cpuTargetStr,
 					targetMemoryStr: memoryTarget,
-					currentConfig: resourceDrift{
-						currentCPUStr: drift.currentCPUStr,
-						currentMemStr: drift.currentMemStr,
-					},
+					currentConfig:   resourceConfig,
 				}
 
-				if drift.currentCPUStr != "NOT_SET" {
-					r.currentConfig.cpuDiff = cpuTargetRaw - drift.cpuDiff
+				if resourceConfig.currentCPUStr != "NOT_SET" {
+					r.currentConfig.cpuDiff = cpuTargetRaw - resourceConfig.currentCPU
 				}
 
-				if drift.currentMemStr != "NOT_SET" {
-					r.currentConfig.memDiff = memoryTargetBytes - drift.memDiff
+				if resourceConfig.currentMemStr != "NOT_SET" {
+					r.currentConfig.memDiff = memoryTargetBytes - resourceConfig.currentMem
 				}
+
+				l.Debug("Container resourceConfig", "container", r.containerName, "currentCPURaw", resourceConfig.currentCPU, "currentMemoryRaw", resourceConfig.currentMem, "recommendedMemory", memoryTargetBytes, "recommendedCPU", cpuTargetRaw)
 
 				results = append(results, r)
 			}
@@ -163,7 +160,7 @@ func main() {
 	}
 }
 
-func calculateCurrentConfigDiff(resourceName, resourceType, containerName, namespace string, client *kubernetes.Clientset) (resourceDrift, error) {
+func currentResourceConfig(resourceName, resourceType, containerName, namespace string, client *kubernetes.Clientset, logger *slog.Logger) (resourceDrift, error) {
 	d := resourceDrift{}
 
 	switch resourceType {
@@ -172,37 +169,37 @@ func calculateCurrentConfigDiff(resourceName, resourceType, containerName, names
 		if err != nil {
 			return d, fmt.Errorf("error getting deployment %s/%s: %v", namespace, resourceName, err)
 		}
-		d = getContainerResourceConfig(deployment.Spec.Template.Spec.Containers, containerName)
+		d = getContainerResourceConfig(deployment.Spec.Template.Spec.Containers, containerName, logger)
 
 	case "StatefulSet":
-		deployment, err := client.AppsV1().StatefulSets(namespace).Get(context.TODO(), resourceName, metav1.GetOptions{})
+		statefulset, err := client.AppsV1().StatefulSets(namespace).Get(context.TODO(), resourceName, metav1.GetOptions{})
 		if err != nil {
 			return d, fmt.Errorf("error getting statefuleset %s/%s: %v", namespace, resourceName, err)
 		}
-		d = getContainerResourceConfig(deployment.Spec.Template.Spec.Containers, containerName)
+		d = getContainerResourceConfig(statefulset.Spec.Template.Spec.Containers, containerName, logger)
 
 	case "DaemonSet":
-		deployment, err := client.AppsV1().DaemonSets(namespace).Get(context.TODO(), resourceName, metav1.GetOptions{})
+		daemonset, err := client.AppsV1().DaemonSets(namespace).Get(context.TODO(), resourceName, metav1.GetOptions{})
 		if err != nil {
 			return d, fmt.Errorf("error getting daemonsets %s/%s: %v", namespace, resourceName, err)
 		}
-		d = getContainerResourceConfig(deployment.Spec.Template.Spec.Containers, containerName)
+		d = getContainerResourceConfig(daemonset.Spec.Template.Spec.Containers, containerName, logger)
 	}
 
 	return d, nil
 }
 
-func getContainerResourceConfig(containers []v1.Container, containerName string) resourceDrift {
+func getContainerResourceConfig(containers []v1.Container, containerName string, _ *slog.Logger) resourceDrift {
 	d := resourceDrift{}
 
 	for _, container := range containers {
 		if strings.ToLower(container.Name) == strings.ToLower(containerName) {
-			cpu := container.Resources.Requests.Cpu().String()
-			if cpu == "0" {
+			cpu := container.Resources.Requests.Cpu().MilliValue()
+			if cpu == 0 {
 				d.currentCPUStr = "NOT_SET"
 			} else {
-				d.currentCPUStr = cpu
-				d.currentCPU = container.Resources.Requests.Cpu().Value()
+				d.currentCPUStr = fmt.Sprintf("%dm", cpu)
+				d.currentCPU = container.Resources.Requests.Cpu().MilliValue()
 			}
 
 			mem := fmt.Sprintf("%dMi", container.Resources.Requests.Memory().Value()/1024/1024)
@@ -227,7 +224,7 @@ func resourceExists(resourceName, resourceType, namespace string, client *kubern
 		if k8serrors.IsNotFound(err) {
 			return false, nil
 		} else if err != nil {
-			return false, fmt.Errorf("error getting deployment: %v", err)
+			return false, fmt.Errorf("error getting deployment %s (%s): %v", resourceName, namespace, err)
 		}
 
 	case "StatefulSet":
@@ -235,7 +232,7 @@ func resourceExists(resourceName, resourceType, namespace string, client *kubern
 		if k8serrors.IsNotFound(err) {
 			return false, nil
 		} else if err != nil {
-			return false, fmt.Errorf("error getting deployment: %v", err)
+			return false, fmt.Errorf("error getting statefuleset %s (%s): %v", resourceName, namespace, err)
 		}
 
 	case "DaemonSet":
@@ -243,7 +240,7 @@ func resourceExists(resourceName, resourceType, namespace string, client *kubern
 		if k8serrors.IsNotFound(err) {
 			return false, nil
 		} else if err != nil {
-			return false, fmt.Errorf("error getting deployment: %v", err)
+			return false, fmt.Errorf("error getting daemonset %s (%s): %v", resourceName, namespace, err)
 		}
 	}
 
@@ -253,9 +250,9 @@ func resourceExists(resourceName, resourceType, namespace string, client *kubern
 func writeResults(results []containerConfig) error {
 	// csv package expects a slice of string slices. Each slice is a CSV row
 	csvSource := make([][]string, 0, len(results))
-	csvSource = append(csvSource, []string{"namespace", "resourceType", "resourceName", "containerName", "targetCPUStr", "targetMemoryStr", "currentCPUStr", "currentMemory", "cpuDiff", "memDiff"})
+	csvSource = append(csvSource, []string{"namespace", "resourceType", "resourceName", "containerName", "VPA Target CPU", "VPA Target Memory", "Current CPU Requests", "Current Memory Requests", "CPU Diff (VPA-Current)", "Memory Diff (VPA-Current)"})
 	for _, r := range results {
-		csvSource = append(csvSource, []string{r.namespace, r.resourceType, r.resourceName, r.containerName, r.targetCPUStr, r.targetMemoryStr, r.currentConfig.currentCPUStr, r.currentConfig.currentMemStr, fmt.Sprintf("%d", r.currentConfig.cpuDiff), fmt.Sprint("%d", r.currentConfig.memDiff)})
+		csvSource = append(csvSource, []string{r.namespace, r.resourceType, r.resourceName, r.containerName, r.targetCPUStr, r.targetMemoryStr, r.currentConfig.currentCPUStr, r.currentConfig.currentMemStr, fmt.Sprintf("%d", r.currentConfig.cpuDiff), fmt.Sprintf("%d", r.currentConfig.memDiff)})
 	}
 
 	_ = os.Remove(resultsFile)

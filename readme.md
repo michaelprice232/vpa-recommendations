@@ -29,3 +29,10 @@ go run ./get-recommendations.go [--namespaces=<comma-separated-list>]
 ### Example CSV output:
 
 ![Example CSV Output](./assets/example-output.png)
+
+### Cleanup
+
+All VPAs have a specific label and so can be cleaned up using the CLI:
+```shell
+kubectl delete vpa -A -l managed-by=vpa-recommendations-script
+```
