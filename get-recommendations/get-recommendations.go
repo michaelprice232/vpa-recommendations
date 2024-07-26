@@ -115,6 +115,10 @@ func main() {
 				continue
 			}
 
+			if len(vpa.Status.Recommendation.ContainerRecommendations) == 0 {
+				l.Info("Skipping as there are no recommendations. The resource may have a VPA unsupported parent controller such as SeldonDeployment", "namespace", namespace, "vpa", vpa.Name, "resourceType", vpa.Spec.TargetRef.Kind, "resourceName", vpa.Spec.TargetRef.Name)
+			}
+
 			for _, containerRecommendation := range vpa.Status.Recommendation.ContainerRecommendations {
 
 				// Get uncapped memory recommendation and store in K8s format converted to MB
