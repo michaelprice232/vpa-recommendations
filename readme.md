@@ -5,6 +5,10 @@ for every deployment/statefulset/daemonset resource in the
 cluster and then extracting the recommendations from each into a CSV format. Designed to be used as part of a pod
 rightsizing exercise whilst taking some of the toil away.
 
+As part of the export it also includes the current container K8s resource requests for CPU/memory and calculates a diff from the
+VPA recommendation, to allow us to see over/under provisioned workloads. Additionally, it checks if the resource already
+has an HPA configured. This is to see if it's eligible for the resource being switched to "auto" VPA mode (doesn't work alongside HPA's). 
+
 Scripts:
 
 - `/manage-vpas`: deploys a VPA for every deployment/statefulset/daemonset resource. Skips if a VPA already exists for that resource
