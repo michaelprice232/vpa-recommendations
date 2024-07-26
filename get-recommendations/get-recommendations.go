@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 
+	autoscaling "k8s.io/api/autoscaling/v2"
 	v1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -36,6 +37,7 @@ type containerConfig struct {
 	targetCPUStr    string
 	targetMemoryStr string
 	currentConfig   resourceDrift
+	hasHPA          bool
 }
 
 type resourceDrift struct {
@@ -89,6 +91,12 @@ func main() {
 
 		l.Debug("Processing namespace", "namespace", namespace)
 
+		// Get HPA targets for this namespace
+		hasHPAMapping, err := hpaMappings(clientset, namespace)
+		if err != nil {
+			panic(err.Error())
+		}
+
 		vpas, err := vpaClient.AutoscalingV1().VerticalPodAutoscalers(namespace).List(context.TODO(), metav1.ListOptions{})
 		if err != nil {
 			panic(err.Error())
@@ -105,6 +113,10 @@ func main() {
 			if !exists {
 				l.Info("target does not exist. Skipping", "namespace", namespace, "vpa", vpa.Name, "resourceType", vpa.Spec.TargetRef.Kind, "resourceName", vpa.Spec.TargetRef.Name)
 				continue
+			}
+
+			if len(vpa.Status.Recommendation.ContainerRecommendations) == 0 {
+				l.Info("Skipping as there are no recommendations. The resource may have a VPA unsupported parent controller such as SeldonDeployment", "namespace", namespace, "vpa", vpa.Name, "resourceType", vpa.Spec.TargetRef.Kind, "resourceName", vpa.Spec.TargetRef.Name)
 			}
 
 			for _, containerRecommendation := range vpa.Status.Recommendation.ContainerRecommendations {
@@ -145,7 +157,13 @@ func main() {
 					r.currentConfig.memDiff = memoryTargetBytes - resourceConfig.currentMem
 				}
 
-				l.Debug("Container resourceConfig", "container", r.containerName, "currentCPURaw", resourceConfig.currentCPU, "currentMemoryRaw", resourceConfig.currentMem, "recommendedMemory", memoryTargetBytes, "recommendedCPU", cpuTargetRaw)
+				for _, hpa := range hasHPAMapping {
+					if strings.ToLower(hpa.Kind) == strings.ToLower(r.resourceType) && strings.ToLower(hpa.Name) == strings.ToLower(r.resourceName) {
+						r.hasHPA = true
+					}
+				}
+
+				l.Debug("Container resourceConfig", "container", r.containerName, "currentCPURaw", resourceConfig.currentCPU, "currentMemoryRaw", resourceConfig.currentMem, "recommendedMemory", memoryTargetBytes, "recommendedCPU", cpuTargetRaw, "hasHPA", r.hasHPA)
 
 				results = append(results, r)
 			}
@@ -158,6 +176,20 @@ func main() {
 	if err != nil {
 		panic(err.Error())
 	}
+}
+
+// hpaMappings returns a slice containing the targets of every HPA in a namespace
+func hpaMappings(clientset *kubernetes.Clientset, namespace string) ([]autoscaling.CrossVersionObjectReference, error) {
+	hpas, err := clientset.AutoscalingV2().HorizontalPodAutoscalers(namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("error getting HPAs: %v", err)
+	}
+	hasHPAMapping := make([]autoscaling.CrossVersionObjectReference, 0, len(hpas.Items))
+	for _, hpa := range hpas.Items {
+		hasHPAMapping = append(hasHPAMapping, hpa.Spec.ScaleTargetRef)
+	}
+
+	return hasHPAMapping, nil
 }
 
 func currentResourceConfig(resourceName, resourceType, containerName, namespace string, client *kubernetes.Clientset, logger *slog.Logger) (resourceDrift, error) {
@@ -250,9 +282,9 @@ func resourceExists(resourceName, resourceType, namespace string, client *kubern
 func writeResults(results []containerConfig) error {
 	// csv package expects a slice of string slices. Each slice is a CSV row
 	csvSource := make([][]string, 0, len(results))
-	csvSource = append(csvSource, []string{"namespace", "resourceType", "resourceName", "containerName", "VPA Target CPU", "VPA Target Memory", "Current CPU Requests", "Current Memory Requests", "CPU Diff (VPA-Current)", "Memory Diff (VPA-Current)"})
+	csvSource = append(csvSource, []string{"namespace", "resourceType", "resourceName", "containerName", "VPA Target CPU", "VPA Target Memory", "Current CPU Requests", "Current Memory Requests", "CPU Diff (VPA-Current)", "Memory Diff (VPA-Current)", "HPA Enabled"})
 	for _, r := range results {
-		csvSource = append(csvSource, []string{r.namespace, r.resourceType, r.resourceName, r.containerName, r.targetCPUStr, r.targetMemoryStr, r.currentConfig.currentCPUStr, r.currentConfig.currentMemStr, fmt.Sprintf("%d", r.currentConfig.cpuDiff), fmt.Sprintf("%d", r.currentConfig.memDiff)})
+		csvSource = append(csvSource, []string{r.namespace, r.resourceType, r.resourceName, r.containerName, r.targetCPUStr, r.targetMemoryStr, r.currentConfig.currentCPUStr, r.currentConfig.currentMemStr, fmt.Sprintf("%d", r.currentConfig.cpuDiff), fmt.Sprintf("%d", r.currentConfig.memDiff), fmt.Sprintf("%t", r.hasHPA)})
 	}
 
 	_ = os.Remove(resultsFile)
