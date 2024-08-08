@@ -33,7 +33,7 @@ func main() {
 	}
 
 	var namespaces []string
-	n := flag.String("namespaces", "", "comma separated list of namespaces")
+	n := flag.String("namespaces", "", "comma separated list of namespaces to target")
 	flag.Parse()
 	if *n != "" {
 		namespaces = strings.Split(*n, ",")
@@ -63,14 +63,7 @@ func main() {
 	}
 
 	for _, namespace := range namespaces {
-
 		l.Debug("Processing namespace", "namespace", namespace)
-
-		vpas, err := vpaClient.AutoscalingV1().VerticalPodAutoscalers(namespace).List(context.TODO(), metav1.ListOptions{})
-		if err != nil {
-			panic(err.Error())
-		}
-		l.Debug("Found VPAs in namespace", "numVPAs", len(vpas.Items), "namespace", namespace)
 
 		resources, err := aggregateResourceNames(clientset, namespace, l)
 		if err != nil {
@@ -78,70 +71,118 @@ func main() {
 		}
 
 		for _, r := range resources {
-			err = createVPA(namespace, r.resourceType, r.resourceName, vpas.Items, vpaClient, l)
+			// Refresh VPAs list for namespace as one may be created by createVPA. This could be more efficient.
+			vpas, err := vpaClient.AutoscalingV1().VerticalPodAutoscalers(namespace).List(context.TODO(), metav1.ListOptions{})
+			if err != nil {
+				panic(err.Error())
+			}
+			l.Debug("Found VPAs in namespace", "numVPAs", len(vpas.Items), "namespace", namespace)
+
+			err = createVPA(namespace, r.apiGroup, r.resourceType, r.resourceName, vpas.Items, vpaClient, l)
 			if err != nil {
 				panic(err.Error())
 			}
 		}
-
 	}
 }
 
 type resource struct {
+	apiGroup     string
 	resourceType string
 	resourceName string
 }
 
-// aggregateResourceNames returns a slice containing deployments, statefulsets and daemonsets for later processing.
+// aggregateResourceNames returns a slice containing deployments, statefulsets and daemonsets in a namespace, for later processing.
+// If a resource is owned by another resource (has an owner reference) the parent resource details are returned instead, as this is required by the VPA.
 func aggregateResourceNames(clientSet *kubernetes.Clientset, namespace string, l *slog.Logger) ([]resource, error) {
 	results := make([]resource, 0)
 
 	deployments, err := clientSet.AppsV1().Deployments(namespace).List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
-		return results, fmt.Errorf("error querying for deployents in %s namespace: %v", namespace, err)
+		return results, fmt.Errorf("error querying for deployents in %s namespace: %w", namespace, err)
 	}
 	l.Debug("Found deployments in namespace", "numDeployments", len(deployments.Items), "namespace", namespace)
 
 	statefulsets, err := clientSet.AppsV1().StatefulSets(namespace).List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
-		return results, fmt.Errorf("error querying for statefulsets in %s namespace: %v", namespace, err)
+		return results, fmt.Errorf("error querying for statefulsets in %s namespace: %w", namespace, err)
 	}
 	l.Debug("Found statefulsets in namespace", "numStatefulsets", len(statefulsets.Items), "namespace", namespace)
 
 	daemonsets, err := clientSet.AppsV1().DaemonSets(namespace).List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
-		return results, fmt.Errorf("error querying for daemonsets in %s namespace: %v", namespace, err)
+		return results, fmt.Errorf("error querying for daemonsets in %s namespace: %w", namespace, err)
 	}
 	l.Debug("Found daemonsets in namespace", "numDaemonsets", len(daemonsets.Items), "namespace", namespace)
 
 	for _, d := range deployments.Items {
-		results = append(results, resource{resourceType: "Deployment", resourceName: d.Name})
+		// Check whether the resource is managed by a parent resource
+		if found, r := checkOwnedBy(d.ObjectMeta); found {
+			results = append(results, resource{resourceType: r.resourceType, resourceName: r.resourceName, apiGroup: r.apiGroup})
+			l.Debug("resource owned by another controller", "childResource", d.Name, "parentType", r.resourceType, "parentName", r.resourceName, "parentAPIGroup", r.apiGroup)
+			continue
+		}
+		results = append(results, resource{resourceType: "Deployment", resourceName: d.Name, apiGroup: "apps/v1"})
 	}
 
 	for _, s := range statefulsets.Items {
-		results = append(results, resource{resourceType: "StatefulSet", resourceName: s.Name})
+		// Check whether the resource is managed by a parent resource
+		if found, r := checkOwnedBy(s.ObjectMeta); found {
+			results = append(results, resource{resourceType: r.resourceType, resourceName: r.resourceName, apiGroup: r.apiGroup})
+			l.Debug("resource owned by another controller", "childResource", s.Name, "parentType", r.resourceType, "parentName", r.resourceName, "parentAPIGroup", r.apiGroup)
+			continue
+		}
+		results = append(results, resource{resourceType: "StatefulSet", resourceName: s.Name, apiGroup: "apps/v1"})
 	}
 
 	for _, d := range daemonsets.Items {
-		results = append(results, resource{resourceType: "DaemonSet", resourceName: d.Name})
+		// Check whether the resource is managed by a parent resource
+		if found, r := checkOwnedBy(d.ObjectMeta); found {
+			results = append(results, resource{resourceType: r.resourceType, resourceName: r.resourceName, apiGroup: r.apiGroup})
+			l.Debug("resource owned by another controller", "childResource", d.Name, "parentType", r.resourceType, "parentName", r.resourceName, "parentAPIGroup", r.apiGroup)
+			continue
+		}
+		results = append(results, resource{resourceType: "DaemonSet", resourceName: d.Name, apiGroup: "apps/v1"})
 	}
 
 	return results, nil
 }
 
-// createVPA creates a new VPA for a deployment/statefulset/daemonset if one does not already exist.
-func createVPA(namespace, resourceType, resourceName string, vpas []verticalAutoscaling.VerticalPodAutoscaler, vpaClient *verticalAutoscalingClientSet.Clientset, l *slog.Logger) error {
+// checkOwnedBy returns true if the resource is managed by another resource, as well as the owner resource details.
+func checkOwnedBy(m metav1.ObjectMeta) (bool, resource) {
+	if len(m.OwnerReferences) == 0 {
+		return false, resource{}
+	}
+
+	// Look for the controller. Only ever contains one.
+	for _, ref := range m.OwnerReferences {
+		if *ref.Controller {
+			return true, resource{
+				apiGroup:     ref.APIVersion,
+				resourceType: ref.Kind,
+				resourceName: ref.Name,
+			}
+		}
+	}
+
+	return false, resource{}
+}
+
+// createVPA creates a new VPA for a target object, if one does not already exist.
+func createVPA(namespace, apiGroup, resourceType, resourceName string, vpas []verticalAutoscaling.VerticalPodAutoscaler, vpaClient *verticalAutoscalingClientSet.Clientset, l *slog.Logger) error {
 	targetRef := autoscaling.CrossVersionObjectReference{
-		APIVersion: "apps/v1",
+		APIVersion: apiGroup,
 		Kind:       resourceType,
 		Name:       resourceName,
 	}
 
+	// Skip if there is an existing VPA with the same config in this namespace
 	if found, existingVPAName := containsVPATarget(&targetRef, vpas); found {
 		l.Info("Found existing VPA. Skipping", "existingVPAName", existingVPAName, "resourceType", resourceType, "resourceName", resourceName)
 		return nil
 	}
 
+	// Run in recommendation only mode
 	var updateMode verticalAutoscaling.UpdateMode = "Off"
 
 	vpa := verticalAutoscaling.VerticalPodAutoscaler{
@@ -165,14 +206,14 @@ func createVPA(namespace, resourceType, resourceName string, vpas []verticalAuto
 
 	_, err := vpaClient.AutoscalingV1().VerticalPodAutoscalers(namespace).Create(context.TODO(), &vpa, metav1.CreateOptions{})
 	if err != nil {
-		return fmt.Errorf("error creating VPA for %s %s: %v", resourceType, resourceName, err)
+		return fmt.Errorf("error creating VPA for %s/%s: %w", resourceType, resourceName, err)
 	}
 	l.Info("Created VPA", "vpaName", vpa.Name, "namespace", namespace)
 
 	return nil
 }
 
-// containsVPATarget checks if a VPA target (spec) is already defined in slice of VPAs.
+// containsVPATarget returns true, including the VPA name, if a VPA target (spec) is already defined in vpas.
 func containsVPATarget(spec *autoscaling.CrossVersionObjectReference, vpas []verticalAutoscaling.VerticalPodAutoscaler) (bool, string) {
 	found := false
 	existingVPAName := ""
@@ -204,7 +245,7 @@ func getNamespaces(client *kubernetes.Clientset) ([]string, error) {
 	return result, nil
 }
 
-// getLogger creates structured logger and default to error level (https://pkg.go.dev/log/slog#Level).
+// getLogger creates structured logger which defaults to info level (https://pkg.go.dev/log/slog#Level).
 func getLogger() (*slog.Logger, error) {
 	var logger *slog.Logger
 
@@ -215,7 +256,7 @@ func getLogger() (*slog.Logger, error) {
 	}
 	level, err := strconv.Atoi(logLevel)
 	if err != nil {
-		return logger, fmt.Errorf("error parsing LOG_LEVEL: %v", err)
+		return logger, fmt.Errorf("error parsing LOG_LEVEL: %w", err)
 	}
 	handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.Level(level)})
 	logger = slog.New(handler)
